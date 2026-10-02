@@ -793,6 +793,23 @@ class Cache(val p : CacheParam) extends Component {
       val occupancy = new CounterUpDown(ctrlLoopbackDepth, handleOverflow = false)
       val allowUpA = !occupancy.mayOverflow
       val fifo = StreamFifo(new CtrlCmd, ctrlLoopbackDepth, forFMax = true)
+
+      // Preserve admission priority until a command gets a general slot, not
+      // merely until it gets another opportunity to retry. Otherwise two
+      // owners can repeatedly exchange a line while older acquires circulate
+      // forever and always see GS_HIT. Match the GS conflict granularity (sets,
+      // including way clashes), rather than just comparing complete addresses.
+      val waiting = Seq.fill(ctrlLoopbackDepth)(new Area {
+        val valid = RegInit(False)
+        val set = Reg(UInt(addressCheckWidth bits))
+      })
+      assert(CountOne(waiting.map(_.valid).asBits) === occupancy.value)
+      for (a <- waiting.indices; b <- 0 until a) {
+        assert(!(waiting(a).valid && waiting(b).valid && waiting(a).set === waiting(b).set))
+      }
+      val waitingFree = OHMasking.first(waiting.map(!_.valid).asBits)
+      def waitingHit(address: UInt): Bool =
+        waiting.map(s => s.valid && s.set === address(addressCheckRange)).orR
     }
 
     val inserter = new inserterStage.Area {
@@ -807,7 +824,7 @@ class Cache(val p : CacheParam) extends Component {
 
       val cmds = ArrayBuffer[Stream[CtrlCmd]]()
       cmds += prober.schedule.toCtrl.pipelined(m2s = true, s2m = true)
-      cmds += fromUpA.toCtrl.continueWhen(loopback.allowUpA && !upAHold)
+      cmds += fromUpA.toCtrl.continueWhen(loopback.allowUpA && !upAHold && !loopback.waitingHit(fromUpA.toCtrl.address))
       cmds += loopbackPop
 
       val onLoopback = new Area{
@@ -834,7 +851,7 @@ class Cache(val p : CacheParam) extends Component {
           }
           upAHold setWhen(regulator.andR)
         }
-        cmds += fromFlushBus.cmd.continueWhen(loopback.allowUpA)
+        cmds += fromFlushBus.cmd.continueWhen(loopback.allowUpA && !loopback.waitingHit(fromFlushBus.cmd.address))
       }
 
       val onFlushFsm = withFlushFsm generate new Area{
@@ -849,13 +866,20 @@ class Cache(val p : CacheParam) extends Component {
           upAHold setWhen(regulator.andR)
         }
 
-        cmds += flushFsm.cmd.continueWhen(loopback.allowUpA)
+        cmds += flushFsm.cmd.continueWhen(loopback.allowUpA && !loopback.waitingHit(flushFsm.cmd.address))
       }
 
       val arbiter = StreamArbiterFactory().lowerFirst.noLock.buildOn(cmds)
 
       when(fromUpA.toCtrl.fire || withFlushFsm.mux(flushFsm.cmd.fire, False) || withFlushBus.mux(fromFlushBus.cmd.fire, False)) {
         loopback.occupancy.increment()
+        assert(loopback.waitingFree.orR)
+        for ((slot, id) <- loopback.waiting.zipWithIndex) {
+          when(loopback.waitingFree(id)) {
+            slot.valid := True
+            slot.set := arbiter.io.output.address(addressCheckRange)
+          }
+        }
       }
 
       up.arbitrateFrom(hazardHalt(arbiter.io.output))
@@ -941,6 +965,12 @@ class Cache(val p : CacheParam) extends Component {
 
       when(up.isFiring && preCtrl.FROM_A && askGs && !redoUpA){
         loopback.occupancy.decrement()
+        assert(loopback.waitingHit(CTRL_CMD.address))
+        for (slot <- loopback.waiting) {
+          when(slot.valid && slot.set === CTRL_CMD.address(addressCheckRange)) {
+            slot.valid := False
+          }
+        }
       }
 
 //      val toProbe = forkStream(enabled = askProbe && !redoUpA).swapPayload(new ProbeCmd())
